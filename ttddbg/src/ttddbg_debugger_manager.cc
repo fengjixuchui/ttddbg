@@ -3,9 +3,11 @@
 #include <iostream>
 #include "ttddbg_debugger_manager.hh"
 #include "ttddbg_strings.hh"
+#include "ttddbg_tracer.hh"
 #include <idp.hpp>
 #include <ida.hpp>
 #include <segment.hpp>
+#include <dbg.hpp>
 
 namespace ttddbg
 {
@@ -48,7 +50,7 @@ namespace ttddbg
 
 	/**********************************************************************/
 	DebuggerManager::DebuggerManager(std::shared_ptr<ttddbg::Logger> logger, Arch arch, Plugin *plugin)
-		: m_logger(logger), m_arch{ arch }, m_isForward{ true }, m_resumeMode{ resume_mode_t::RESMOD_NONE }, m_positionChooser(new PositionChooser(m_logger)), m_nextPosition{ 0 }, m_processId(1234), m_backwardsSingleStep(false), m_plugin(plugin)
+		: m_logger(logger), m_arch{ arch }, m_isForward{ true }, m_resumeMode{ resume_mode_t::RESMOD_NONE }, m_positionChooser(new PositionChooser(m_logger)), m_traceChooser(new TracerTraceChooser()), m_eventChooser(new TracerEventChooser()), m_nextPosition{0}, m_processId(1234), m_backwardsSingleStep(false), m_plugin(plugin)
 	{
 	}
 
@@ -63,6 +65,7 @@ namespace ttddbg
 	ssize_t DebuggerManager::OnTermDebugger()
 	{
 		m_plugin->hideActions();
+		FunctionTracer::destroy();
 		return DRC_OK;
 	}
 
@@ -127,6 +130,16 @@ namespace ttddbg
 		
 		// Init cursor at the first position
 		m_cursor->SetPosition(m_engine.GetFirstPosition());
+
+		// Init the function tracer
+		FunctionTracer::getInstance()->setEngine(m_engine);
+		FunctionTracer::getInstance()->setCursor(m_cursor);
+		FunctionTracer::getInstance()->setNewTraceCallback([this](func_t* func) {
+			this->refreshTraceChooser();
+		});
+		FunctionTracer::getInstance()->setNewEventCallback([this](FunctionInvocation) {
+			this->refreshTraceEventsChooser();
+		});
 
 		m_events.addProcessStartEvent(
 			m_processId,
@@ -250,7 +263,7 @@ namespace ttddbg
 			if (m_nextPosition.Major != 0 || m_nextPosition.Minor != 0) {
 				// Special case: instead of stepping or resuming, if there is a "next position" saved,
 				// go to this position instead
-				m_logger->info("special case: next position: ", m_nextPosition.Major, " ", m_nextPosition.Minor);
+				m_logger->info("special case: next position: ", m_nextPosition.Major, ":", m_nextPosition.Minor);
 				this->applyCursor(m_nextPosition);
 				m_events.addBreakPointEvent(m_processId, m_cursor->GetThreadInfo()[0].threadid, m_cursor->GetProgramCounter());
 				m_nextPosition = { 0 };
@@ -386,8 +399,6 @@ namespace ttddbg
 		std::set<TTD::TTD_Replay_Module*> moduleAfter = getCursorModules();
 
 		applyDifferences(threadBefore, threadAfter, moduleBefore, moduleAfter);
-
-		m_logger->info("Now at position ", m_cursor->GetPosition()->Major, " ", m_cursor->GetPosition()->Minor);
 	}
 
 	/**********************************************************************/
@@ -401,8 +412,6 @@ namespace ttddbg
 		std::set<TTD::TTD_Replay_Module*> moduleAfter = getCursorModules();
 
 		applyDifferences(threadBefore, threadAfter, moduleBefore, moduleAfter);
-
-		m_logger->info("Now at position ", m_cursor->GetPosition()->Major, " ", m_cursor->GetPosition()->Minor);
 	}
 
 	/**********************************************************************/
@@ -481,6 +490,55 @@ namespace ttddbg
 	}
 
 	/**********************************************************************/
+	void DebuggerManager::requestFullRun()
+	{
+#define TTD_STEP 100000
+
+		show_wait_box("HIDECANCEL\nPlease wait...");
+
+		TTD::Position old = *m_cursor->GetPosition();
+		
+		FunctionTracer::getInstance()->setCursor(m_cursor);
+		
+		TTD::Position cur;
+		size_t count = 0;
+		TTD::TTD_Replay_ICursorView_ReplayResult rresult;
+
+		const TTD::TTD_Replay_ThreadCreatedEvent* threadCreateEvents = m_engine.GetThreadCreatedEventList();
+		const TTD::TTD_Replay_ThreadTerminatedEvent* threadTerminateEvents = m_engine.GetThreadTerminatedEventList();
+
+		for (int i = 0; i < m_engine.GetThreadCreatedEventCount(); i++) {
+			auto tCreate = threadCreateEvents[i];
+			auto tTerminate = threadTerminateEvents[i];
+
+			TTD::Position first = tCreate.pos, last = tTerminate.pos;
+			m_cursor->SetPosition(&first);
+			cur = *m_cursor->GetPosition();
+			count = 0;
+
+			while (cur.Major != last.Major || cur.Minor != last.Minor) {
+				m_cursor->ReplayForward(&rresult, &last, TTD_STEP);
+				cur = *m_cursor->GetPosition();
+				count++;
+
+				int percentage = (int)(((double)cur.Major / (double)last.Major) * 100.0);
+				replace_wait_box("Thread %d\n%d iterations done (%d%%)", i, count, percentage);
+
+				if (user_cancelled())
+					break;
+			}
+
+			if (user_cancelled())
+				break;
+		}
+
+		m_cursor->SetPosition(&old);
+		hide_wait_box();
+
+		msg("[ttddbg] full run completed\n");
+	}
+
+	/**********************************************************************/
 	void DebuggerManager::requestBackwardsSingleStep()
 	{
 		m_backwardsSingleStep = true;
@@ -494,8 +552,64 @@ namespace ttddbg
 	}
 
 	/**********************************************************************/
+	void DebuggerManager::openTraceChooser() {
+		if (m_traceChooser != nullptr) {
+			m_traceChooser->choose();
+		}
+	}
+
+	void DebuggerManager::refreshTraceChooser() {
+		if (m_traceChooser != nullptr) {
+			refresh_chooser(m_traceChooser->title);
+		}
+	}
+
+	/**********************************************************************/
+	void DebuggerManager::openTraceEventsChooser() {
+		if (m_eventChooser != nullptr) {
+			m_eventChooser->choose();
+		}
+	}
+
+	void DebuggerManager::refreshTraceEventsChooser() {
+		if (m_traceChooser != nullptr) {
+			refresh_chooser(m_eventChooser->title);
+		}
+	}
+
+	/**********************************************************************/
 	void DebuggerManager::setNextPosition(TTD::Position newPos) {
 		m_nextPosition = newPos;
+	}
+
+	/**********************************************************************/
+	void DebuggerManager::gotoPosition() {
+		qstring pos;
+		bool ok = ask_str(&pos, 0, "Go to position (Major:Minor): ");
+		if (!ok) {
+			return;
+		}
+
+		int colon = pos.find(":");
+		if (colon == -1) {
+			warning("Invalid position format");
+			return;
+		}
+
+		if (colon == pos.size()) {
+			warning("Invalid position format: missing minor");
+			return;
+		}
+
+		qstring major = pos.substr(0, colon);
+		qstring minor = pos.substr(colon + 1, -1);
+
+		long lMaj = strtol(major.c_str(), NULL, 0);
+		long lMin = strtol(minor.c_str(), NULL, 0);
+
+		TTD::Position newPos{(unsigned __int64)lMaj, (unsigned __int64)lMin};
+		setNextPosition(newPos);
+		continue_process();
 	}
 
 	/**********************************************************************/
